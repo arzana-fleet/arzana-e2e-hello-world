@@ -9,7 +9,11 @@
 //   - SDK-only secret (STRIPE_KEY) — Key-Vault-backed; the platform never
 //     emits it as an env var. The app reads it directly via azsecrets,
 //     using ARZANA_KV_URL (the per-env vault URL) and the runtime's
-//     managed identity.
+//     managed identity. The user-facing key (STRIPE_KEY) is not a
+//     legal KV secret name and the platform may also scope it (e.g.
+//     shared--STRIPE-KEY), so the app does NOT hard-code the path —
+//     it reads ARZANA_SECRET_PATH_STRIPE_KEY which the platform
+//     injects per catalog secret.
 //
 // The app exposes:
 //
@@ -43,14 +47,20 @@ func main() {
 		addr = ":" + addr
 	}
 
+	// User-facing secret name. The actual KV path is platform-managed
+	// and may differ (e.g. shared--STRIPE-KEY); we discover it via
+	// ARZANA_SECRET_PATH_<KEY>, which the platform stamps for every
+	// catalog secret at deploy time.
+	const secretKey = "STRIPE_KEY"
 	app := &server{
-		log:    log,
-		kvURL:  os.Getenv("ARZANA_KV_URL"),
-		env:    os.Getenv("ARZANA_ENV"),
-		svc:    os.Getenv("ARZANA_SERVICE"),
-		foo:    os.Getenv("FOO"),
-		bar:    os.Getenv("BAR"),
-		secret: "STRIPE_KEY",
+		log:        log,
+		kvURL:      os.Getenv("ARZANA_KV_URL"),
+		env:        os.Getenv("ARZANA_ENV"),
+		svc:        os.Getenv("ARZANA_SERVICE"),
+		foo:        os.Getenv("FOO"),
+		bar:        os.Getenv("BAR"),
+		secretKey:  secretKey,
+		secretPath: os.Getenv("ARZANA_SECRET_PATH_" + secretKey),
 	}
 
 	// Build the SDK client lazily — at boot time the runtime's MI may
@@ -65,7 +75,7 @@ func main() {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	log.Info("hello-world starting", "addr", addr, "env", app.env, "kv_url", app.kvURL, "service", app.svc)
+	log.Info("hello-world starting", "addr", addr, "env", app.env, "kv_url", app.kvURL, "service", app.svc, "secret_key", app.secretKey, "secret_path", app.secretPath)
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		log.Error("server error", "error", err)
 		os.Exit(1)
@@ -73,13 +83,14 @@ func main() {
 }
 
 type server struct {
-	log    *slog.Logger
-	kvURL  string
-	env    string
-	svc    string
-	foo    string
-	bar    string
-	secret string
+	log        *slog.Logger
+	kvURL      string
+	env        string
+	svc        string
+	foo        string
+	bar        string
+	secretKey  string
+	secretPath string
 
 	once   sync.Once
 	client *azsecrets.Client
@@ -118,6 +129,9 @@ func (s *server) resolveStripe(ctx context.Context) (string, error) {
 	if s.kvURL == "" {
 		return "", errors.New("ARZANA_KV_URL not set — platform did not inject the per-env vault url")
 	}
+	if s.secretPath == "" {
+		return "", fmt.Errorf("ARZANA_SECRET_PATH_%s not set — platform did not inject the per-secret vault path", s.secretKey)
+	}
 	s.once.Do(func() {
 		cred, err := azidentity.NewDefaultAzureCredential(nil)
 		if err != nil {
@@ -134,12 +148,12 @@ func (s *server) resolveStripe(ctx context.Context) (string, error) {
 	if s.client == nil {
 		return "", fmt.Errorf("azsecrets client not initialised — see prior logs")
 	}
-	resp, err := s.client.GetSecret(ctx, s.secret, "", nil)
+	resp, err := s.client.GetSecret(ctx, s.secretPath, "", nil)
 	if err != nil {
-		return "", fmt.Errorf("get secret %q: %w", s.secret, err)
+		return "", fmt.Errorf("get secret %q (path=%s): %w", s.secretKey, s.secretPath, err)
 	}
 	if resp.Value == nil {
-		return "", fmt.Errorf("secret %q has no value", s.secret)
+		return "", fmt.Errorf("secret %q (path=%s) has no value", s.secretKey, s.secretPath)
 	}
 	return *resp.Value, nil
 }
